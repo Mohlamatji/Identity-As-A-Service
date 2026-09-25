@@ -1,0 +1,11 @@
+{
+  "name": "identity-vault-css-build",
+  "private": true,
+  "description": "Dev-only tooling to compile the production Tailwind CSS. Not needed to run the app - only to regenerate public/css/app.css after changing view markup.",
+  "scripts": {
+    "build:css": "tailwindcss -i ./src.css -o ../public/css/app.css --minify"
+  },
+  "devDependencies": {
+    "tailwindcss": "^3.4.0"
+  }
+}

@@ -1,0 +1,11 @@
+# Only relevant for Apache (e.g. XAMPP). Not used by `php -S`, which has
+# this fallback behavior built in.
+#
+# Routes any request that isn't a real file or directory here through
+# index.php, so pretty URLs (/dashboard, /api/enroll, etc.) reach the app's
+# router instead of producing an Apache 404. Real files (js/capture.js,
+# decision-status.js) are excluded and served directly.
+RewriteEngine On
+RewriteCond %{REQUEST_FILENAME} !-f
+RewriteCond %{REQUEST_FILENAME} !-d
+RewriteRule ^ index.php [QSA,L]

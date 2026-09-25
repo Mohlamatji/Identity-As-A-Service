@@ -1,0 +1,11 @@
+# Real secrets - never commit this. See config/local.php.example.
+/config/local.php
+
+# Local SQLite database
+/storage/database.sqlite
+
+# Dev-only build tooling
+/build/node_modules
+
+# .env files, if you use one instead of config/local.php
+.env

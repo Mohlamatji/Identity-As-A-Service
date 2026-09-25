@@ -1,0 +1,584 @@
+openapi: 3.0.3
+info:
+  title: Identity Vault API
+  description: 'Biometric-first KYC / fraud-prevention pilot API. All monetary amounts are in ZAR (South
+    African Rand), represented as integer cents.
+
+    '
+  version: 0.2.0
+servers:
+- url: /
+  description: Relative to wherever this app is deployed (works under both `php -S` and Apache/XAMPP subfolder
+    deployments)
+security:
+- ApiKeyAuth: []
+tags:
+- name: Identity
+  description: Enrollment and biometric authentication
+- name: Transactions
+  description: Fraud-checked transaction approval
+- name: Behavior
+  description: Device/location baseline tracking and anomaly checks
+- name: Admin
+  description: Dashboard data endpoints
+- name: Consent
+  description: Explicit consent records required before DHA verification (per VerifyNow terms)
+- name: Compliance
+  description: POPIA data subject rights and retention policy
+paths:
+  /api/enroll:
+    post:
+      tags:
+      - Identity
+      summary: Create a user (if needed) and enroll their biometric template
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - id_number
+              - full_name
+              - dob
+              - phone
+              - image_base64
+              properties:
+                id_number:
+                  type: string
+                  example: '8001015009087'
+                full_name:
+                  type: string
+                  example: Jane Test
+                dob:
+                  type: string
+                  format: date
+                  example: '1980-01-01'
+                phone:
+                  type: string
+                  example: 0821234567
+                image_base64:
+                  type: string
+                  description: Base64-encoded JPEG frame from the browser
+                mode:
+                  type: string
+                  enum:
+                  - real
+                  - simulated
+                  default: simulated
+                blink_detected:
+                  type: boolean
+                head_turn_detected:
+                  type: boolean
+                frames_analyzed:
+                  type: integer
+                duration_ms:
+                  type: integer
+      responses:
+        '200':
+          description: Enrollment result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: enrolled
+                  user_id:
+                    type: integer
+                  confidence:
+                    type: number
+                    format: float
+                  message:
+                    type: string
+                  liveness:
+                    $ref: '#/components/schemas/LivenessResult'
+                  vault_match:
+                    $ref: '#/components/schemas/VaultMatchResult'
+        '422':
+          description: Missing required fields
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/authenticate:
+    post:
+      tags:
+      - Identity
+      summary: Verify a biometric sample against the vault (no transaction recorded)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              - image_base64
+              properties:
+                user_id:
+                  type: integer
+                image_base64:
+                  type: string
+                mode:
+                  type: string
+                  enum:
+                  - real
+                  - simulated
+                  default: simulated
+                blink_detected:
+                  type: boolean
+                head_turn_detected:
+                  type: boolean
+                frames_analyzed:
+                  type: integer
+                duration_ms:
+                  type: integer
+      responses:
+        '200':
+          description: Authentication result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                    - approved
+                    - rejected
+                    example: approved
+                  confidence:
+                    type: number
+                    format: float
+                    example: 0.92
+                  message:
+                    type: string
+                    example: Biometric match successful
+        '422':
+          description: Missing fields or user not enrolled
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+        '429':
+          description: Too many authentication attempts (rate limited)
+  /api/transaction/approve:
+    post:
+      tags:
+      - Transactions
+      summary: Full pipeline - DHA verification, behavioral analytics, decision engine
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              - id_number
+              properties:
+                user_id:
+                  type: integer
+                id_number:
+                  type: string
+                bank_partner_id:
+                  type: string
+                  default: demo-bank
+                amount_cents:
+                  type: integer
+                  description: Amount in ZAR cents, e.g. 500000 = R 5,000.00
+                  example: 500000
+                currency:
+                  type: string
+                  default: ZAR
+                realtime:
+                  type: boolean
+                  default: true
+                liveness:
+                  $ref: '#/components/schemas/LivenessResult'
+                vault_match:
+                  $ref: '#/components/schemas/VaultMatchResult'
+                selfie_base64:
+                  type: string
+                device_fingerprint:
+                  type: string
+                ip_country:
+                  type: string
+                  example: ZA
+                new_device:
+                  type: boolean
+                  description: Explicit override for demos - forces the anomaly path
+                ip_country_mismatch:
+                  type: boolean
+                  description: Explicit override for demos
+      responses:
+        '200':
+          description: Decision result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum:
+                    - approved
+                    - flagged
+                    - rejected
+                  confidence:
+                    type: number
+                    format: float
+                  message:
+                    type: string
+                  transaction_id:
+                    type: integer
+                  amount:
+                    type: string
+                    example: R 5,000.00
+                  currency:
+                    type: string
+                    example: ZAR
+                  score:
+                    type: number
+                  dha:
+                    type: object
+                    properties:
+                      match_result:
+                        type: string
+                        enum:
+                        - match
+                        - no_match
+                        - error
+                      query_type:
+                        type: string
+                        enum:
+                        - realtime
+                        - batch
+                      cost_cents:
+                        type: integer
+                  behavioral:
+                    type: object
+        '404':
+          description: User not found - call /api/enroll first
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+        '429':
+          description: Too many transaction attempts (rate limited)
+        '403':
+          description: No valid consent on file - call /api/consent/grant first
+  /api/behavior/update:
+    post:
+      tags:
+      - Behavior
+      summary: Set/refresh a user's device+location baseline
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              properties:
+                user_id:
+                  type: integer
+                device_fingerprint:
+                  type: string
+                ip_country:
+                  type: string
+      responses:
+        '200':
+          description: Baseline updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: updated
+                  user_id:
+                    type: integer
+                  device_fingerprint:
+                    type: string
+                  ip_country:
+                    type: string
+        '404':
+          description: User not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/fraud/check:
+    get:
+      tags:
+      - Behavior
+      summary: Standalone anomaly check against the stored baseline (no transaction recorded)
+      parameters:
+      - name: user_id
+        in: query
+        required: true
+        schema:
+          type: integer
+      - name: device_fingerprint
+        in: query
+        schema:
+          type: string
+      - name: ip_country
+        in: query
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Anomaly + velocity flags
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id:
+                    type: integer
+                  anomaly:
+                    type: object
+                    properties:
+                      new_device:
+                        type: boolean
+                      ip_country_mismatch:
+                        type: boolean
+                      has_baseline:
+                        type: boolean
+                  velocity:
+                    type: object
+                    properties:
+                      transactions_last_hour:
+                        type: integer
+                      flagged:
+                        type: boolean
+        '404':
+          description: User not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/transactions:
+    get:
+      tags:
+      - Admin
+      summary: Recent transactions across all users (dashboard data)
+      responses:
+        '200':
+          description: List of transactions
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/audit-log:
+    get:
+      tags:
+      - Admin
+      summary: Append-only audit trail (dashboard data)
+      responses:
+        '200':
+          description: List of audit entries
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/webhook/notify/{transactionId}:
+    post:
+      tags:
+      - Transactions
+      summary: Fire the simulated bank API call (approved) or fraud alert (rejected/flagged) for a transaction
+      parameters:
+      - name: transactionId
+        in: path
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Webhook fired
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  action:
+                    type: string
+                    enum:
+                    - bank_api_call
+                    - fraud_alert_review
+                  result:
+                    type: string
+        '404':
+          description: Transaction not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/consent/grant:
+    post:
+      tags:
+      - Consent
+      summary: Record explicit consent for DHA verification (required before /api/transaction/approve)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              - reason
+              properties:
+                user_id:
+                  type: integer
+                reason:
+                  type: string
+                  example: KYC identity verification for banking transaction
+                validity_days:
+                  type: integer
+                  default: 365
+                  minimum: 1
+                  maximum: 3650
+      responses:
+        '200':
+          description: Consent recorded
+        '422':
+          description: Missing/invalid fields
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/consent/status:
+    get:
+      tags:
+      - Consent
+      summary: Check a user's current consent status
+      parameters:
+      - name: user_id
+        in: query
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Consent status
+        '404':
+          description: User not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/consent/revoke:
+    post:
+      tags:
+      - Consent
+      summary: Revoke a user's active consent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              properties:
+                user_id:
+                  type: integer
+      responses:
+        '200':
+          description: Revocation result
+        '404':
+          description: User not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/dha-verifications:
+    get:
+      tags:
+      - Admin
+      summary: Full (decrypted) bureau response history for one user - compliance/investigation use
+      parameters:
+      - name: user_id
+        in: query
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: DHA verification history, including the full raw bureau response
+        '422':
+          description: user_id query param missing
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/data-subject/export:
+    get:
+      tags:
+      - Compliance
+      summary: Full data export for a user (POPIA s23-24)
+      parameters:
+      - name: user_id
+        in: query
+        required: true
+        schema:
+          type: integer
+      responses:
+        '200':
+          description: Full export
+        '404':
+          description: User not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/data-subject/delete-request:
+    post:
+      tags:
+      - Compliance
+      summary: Process an erasure request (POPIA s25) - deletes what's deletable, reports what's retained
+        and why
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              properties:
+                user_id:
+                  type: integer
+      responses:
+        '200':
+          description: Erasure processed
+        '404':
+          description: User not found
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/admin/retention/run:
+    post:
+      tags:
+      - Compliance
+      summary: Run the configured retention policy on demand
+      responses:
+        '200':
+          description: Retention run summary
+        '401':
+          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+      description: 'Only enforced if the API_KEY environment variable is set on the server. Unset by default
+        (dev-friendly) - all endpoints are open until you configure it.
+
+        '
+  schemas:
+    LivenessResult:
+      type: object
+      properties:
+        passed:
+          type: boolean
+        mode:
+          type: string
+          enum:
+          - real
+          - simulated
+        reason:
+          type: string
+    VaultMatchResult:
+      type: object
+      properties:
+        is_first_enrollment:
+          type: boolean
+        matched:
+          type: boolean
+        confidence:
+          type: number
+          format: float
+        reason:
+          type: string
