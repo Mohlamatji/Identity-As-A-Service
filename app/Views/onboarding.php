@@ -1,4 +1,10 @@
-<?php $security = require __DIR__ . '/../../config/security.php'; ?>
+<?php
+// Demo console only (DEMO_MODE): mint a 15-minute, scope-limited browser token
+// instead of embedding the long-lived API key in the page like the original did.
+$demoToken = (new App\Services\ClientAuthService())->mintClientToken(
+    new App\Support\AuthContext('open', 'demo-console', 'Demo console', ['*'], 300), App\Services\ClientAuthService::ALL_SCOPES, null, true
+)['client_token'];
+?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -20,6 +26,7 @@
     </div>
     <nav class="flex items-center gap-1 text-sm">
       <a href="./" class="px-3 py-1.5 rounded text-white bg-white/5">Console</a>
+      <a href="checkout" class="px-3 py-1.5 rounded text-mute hover:text-white transition-colors">PayPal checkout</a>
       <a href="dashboard" class="px-3 py-1.5 rounded text-mute hover:text-white transition-colors">Dashboard</a>
       <a href="api-docs" class="px-3 py-1.5 rounded text-mute hover:text-white transition-colors">API docs</a>
     </nav>
@@ -160,12 +167,11 @@
   <section id="panel_authenticate" class="rounded-lg border border-line bg-panel p-6 mt-6 hidden">
     <div class="flex items-center justify-between mb-1">
       <h2 class="font-medium text-white">Authenticate</h2>
-      <span class="text-[11px] text-mute mono">POST /api/authenticate</span>
+      <span class="text-[11px] text-mute mono">POST /api/verify/session</span>
     </div>
-    <p class="text-sm text-mute mb-5">Re-verifies against the template from step 1 - confirms this is the same enrolled person.</p>
+    <p class="text-sm text-mute mb-5">The server issues a random liveness challenge (e.g. blink &rarr; turn &rarr; open mouth), validates your response, matches your face to the enrolled template, and returns a <strong class="text-slate-300">single-use verification token</strong>. Approval only accepts that token - never client-reported results.</p>
     <div class="flex gap-2 flex-wrap">
-      <button onclick="capturePhoto()" class="rounded bg-ink border border-line hover:border-gold text-sm px-4 py-2 transition-colors">Capture new frame</button>
-      <button onclick="authenticateUser()" class="rounded bg-teal text-ink font-medium text-sm px-4 py-2 hover:bg-white transition-colors">Authenticate</button>
+      <button onclick="authenticateUser()" class="rounded bg-teal text-ink font-medium text-sm px-4 py-2 hover:bg-white transition-colors">Start liveness &amp; authenticate</button>
     </div>
     <div id="authenticate_result" class="mt-4"></div>
   </section>
@@ -176,7 +182,7 @@
       <h2 class="font-medium text-white">Approve a transaction</h2>
       <span class="text-[11px] text-mute mono">POST /api/transaction/approve</span>
     </div>
-    <p class="text-sm text-mute mb-5">Runs DHA verification, behavioral analytics, and the decision engine end to end.</p>
+    <p class="text-sm text-mute mb-5">Spends the verification token, then runs the ID check, DHA verification, behavioral analytics and the explainable decision engine.</p>
 
     <div class="grid grid-cols-3 gap-3 mb-4">
       <label class="block">
@@ -230,13 +236,14 @@
     <div id="webhook_result" class="mt-4"></div>
   </section>
 
-  <p class="text-xs text-mute mt-10">Test console - not production UI. See <a href="api-docs" class="text-teal hover:text-white underline">API docs</a> for the full endpoint reference.</p>
+  <p class="text-xs text-mute mt-10">Demo console (DEMO_MODE only) - not production UI. See <a href="api-docs" class="text-teal hover:text-white underline">API docs</a> for the full endpoint reference.</p>
 </main>
 
-<script>window.__API_KEY__ = <?= json_encode($security['api_key'] ?? '') ?>;</script>
+<script>window.__TOKEN__ = <?= json_encode($demoToken) ?>;</script>
 <script src="js/ui.js"></script>
+<script src="js/identity-vault.js"></script>
 <script src="js/capture.js"></script>
 <script src="js/decision-status.js"></script>
-<script>Wizard.init();</script>
+<script>Wizard.init(); IdentityVault.behavior.attach(document);</script>
 </body>
 </html>

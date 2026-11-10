@@ -13,7 +13,7 @@ async function grantConsent() {
   }
   const res = await fetch('api/consent/grant', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': window.__API_KEY__ || '' },
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + window.__TOKEN__ },
     body: JSON.stringify({
       user_id: window.__vault.userId,
       reason: document.getElementById('consent_reason').value,
@@ -41,7 +41,7 @@ async function checkConsentStatus() {
     return;
   }
   const res = await fetch(`api/consent/status?user_id=${window.__vault.userId}`, {
-    headers: { 'X-Api-Key': window.__API_KEY__ || '' },
+    headers: { Authorization: 'Bearer ' + window.__TOKEN__ },
   });
   const data = await res.json();
   renderResultCard('consent_result', {
@@ -59,7 +59,7 @@ async function revokeConsent() {
   }
   const res = await fetch('api/consent/revoke', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': window.__API_KEY__ || '' },
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + window.__TOKEN__ },
     body: JSON.stringify({ user_id: window.__vault.userId }),
   });
   const data = await res.json();
@@ -75,30 +75,26 @@ async function authenticateUser() {
     renderResultCard('authenticate_result', { tone: 'warn', title: 'Enroll first' });
     return;
   }
-  const livenessMeta = window.__vault.pendingLivenessMeta || { mode: 'simulated', gesture_completed: true, frame_count: 15, duration_ms: 2200 };
-  const res = await fetch('api/authenticate', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': window.__API_KEY__ || '' },
-    body: JSON.stringify({
-      user_id: window.__vault.userId,
-      image_base64: window.__vault.imageBase64,
-      descriptor: window.__vault.pendingDescriptor ?? null,
-      ...livenessMeta,
-    }),
+  renderResultCard('authenticate_result', { tone: 'neutral', title: 'Starting liveness challenge...', detail: 'Follow the prompts above the camera.' });
+  const r = await IdentityVault.verify({
+    clientToken: window.__TOKEN__, userId: window.__vault.userId, video: document.getElementById('video'),
+    canvas: document.getElementById('canvas'), onPrompt: showPrompt,
+    amountCents: zarToCents(document.getElementById('amount_rand').value) || undefined,
   });
-  const data = await res.json();
-  const approved = data.status === 'approved';
+  document.getElementById('video_wrap').classList.remove('scanning');
+  if (r.ok) window.__vault.verificationToken = r.verificationToken;
   renderResultCard('authenticate_result', {
-    tone: approved ? 'success' : 'danger',
-    title: approved ? 'Biometric match confirmed' : 'Biometric match failed',
-    detail: data.message,
-    fields: [['Confidence', `${(data.confidence * 100).toFixed(1)}%`]],
-    raw: data,
+    tone: r.ok ? 'success' : 'danger',
+    title: r.ok ? 'Verified - single-use token issued' : 'Verification failed',
+    detail: r.message,
+    fields: r.liveness ? [
+      ['Liveness', `${r.liveness.passed ? 'passed' : 'failed'} (${r.liveness.mode}, score ${r.liveness.score})`],
+      ['Face match', r.vault_match.distance != null ? `distance ${r.vault_match.distance}` : (r.vault_match.matched ? 'ok' : 'no')],
+    ] : [],
+    extraHtml: r.liveness ? `<div class="mt-3 space-y-1">${(r.liveness.signals || []).map((x) => `<div class="text-xs ${x.ok ? 'text-teal' : 'text-danger'}">${x.ok ? '✓' : '✗'} ${esc(x.detail)}</div>`).join('')}</div>` : '',
+    raw: r.raw,
   });
-  if (approved) {
-    Wizard.markComplete('authenticate');
-    Wizard.next('authenticate');
-  }
+  if (r.ok) { Wizard.markComplete('authenticate'); Wizard.next('authenticate'); }
 }
 
 async function runTransactionApprove() {
@@ -107,9 +103,13 @@ async function runTransactionApprove() {
     return;
   }
 
+  if (!window.__vault.verificationToken) {
+    renderResultCard('decision_result', { tone: 'warn', title: 'Authenticate first', detail: 'Approval needs a fresh single-use verification token. Run the Authenticate step (each token works once).' });
+    return;
+  }
   const res = await fetch('api/transaction/approve', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': window.__API_KEY__ || '' },
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + window.__TOKEN__, 'Idempotency-Key': 'console-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10) },
     body: JSON.stringify({
       user_id: window.__vault.userId,
       id_number: document.getElementById('id_number').value,
@@ -117,8 +117,7 @@ async function runTransactionApprove() {
       amount_cents: zarToCents(document.getElementById('amount_rand').value),
       currency: 'ZAR',
       realtime: true,
-      liveness: window.__vault.livenessResult,
-      vault_match: window.__vault.vaultMatchResult,
+      verification_token: window.__vault.verificationToken,
       selfie_base64: window.__vault.imageBase64,
       device_fingerprint: document.getElementById('device_fingerprint').value,
       ip_country: document.getElementById('ip_country').value,
@@ -130,23 +129,26 @@ async function runTransactionApprove() {
   });
   const data = await res.json();
 
-  if (res.status === 403) {
-    renderResultCard('decision_result', { tone: 'danger', title: 'Blocked - no valid consent', detail: data.message, raw: data });
+  if (res.status !== 200) {
+    renderResultCard('decision_result', { tone: 'danger', title: res.status === 403 ? 'Blocked' : 'Request refused', detail: data.message, raw: data });
     return;
   }
+  window.__vault.verificationToken = null; // spent
 
   window.__vault.lastTransactionId = data.transaction_id;
   const toneMap = { approved: 'success', flagged: 'warn', rejected: 'danger' };
   renderResultCard('decision_result', {
     tone: toneMap[data.status] || 'neutral',
-    title: data.status === 'approved' ? 'Transaction approved' : data.status === 'flagged' ? 'Flagged for review' : 'Transaction rejected',
+    title: data.status === 'approved' ? 'Transaction approved' : data.status === 'flagged' ? (data.required_action === 'step_up' ? 'Step-up verification required' : 'Flagged for review') : 'Transaction rejected',
     detail: data.message,
     fields: [
       ['Amount', data.amount],
       ['Score', `${data.score}/100`],
       ['DHA result', data.dha ? data.dha.match_result : '-'],
       ['Transaction ID', `#${data.transaction_id}`],
+      ['Next step', data.required_action || (data.status === 'approved' ? 'proceed' : 'none')],
     ],
+    extraHtml: renderFactors(data),
     raw: data,
   });
   Wizard.markComplete('approve');
@@ -163,7 +165,7 @@ async function runFraudCheck() {
     device_fingerprint: document.getElementById('device_fingerprint').value,
     ip_country: document.getElementById('ip_country').value,
   });
-  const res = await fetch('api/fraud/check?' + params.toString(), { headers: { 'X-Api-Key': window.__API_KEY__ || '' } });
+  const res = await fetch('api/fraud/check?' + params.toString(), { headers: { Authorization: 'Bearer ' + window.__TOKEN__ } });
   const data = await res.json();
   const anomalous = data.anomaly && (data.anomaly.new_device || data.anomaly.ip_country_mismatch || data.velocity.flagged);
   renderResultCard('fraud_result', {
@@ -185,7 +187,7 @@ async function runWebhook() {
     renderResultCard('webhook_result', { tone: 'warn', title: 'Approve a transaction first' });
     return;
   }
-  const res = await fetch(`api/webhook/notify/${window.__vault.lastTransactionId}`, { method: 'POST', headers: { 'X-Api-Key': window.__API_KEY__ || '' } });
+  const res = await fetch(`api/webhook/notify/${window.__vault.lastTransactionId}`, { method: 'POST', headers: { Authorization: 'Bearer ' + window.__TOKEN__ } });
   const data = await res.json();
   renderResultCard('webhook_result', {
     tone: data.action === 'bank_api_call' ? 'success' : 'warn',
@@ -202,7 +204,7 @@ async function exportMyData() {
     return;
   }
   const res = await fetch(`api/data-subject/export?user_id=${window.__vault.userId}`, {
-    headers: { 'X-Api-Key': window.__API_KEY__ || '' },
+    headers: { Authorization: 'Bearer ' + window.__TOKEN__ },
   });
   const data = await res.json();
   if (res.status !== 200) {
@@ -232,7 +234,7 @@ async function deleteMyData() {
   }
   const res = await fetch('api/data-subject/delete-request', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-Api-Key': window.__API_KEY__ || '' },
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + window.__TOKEN__ },
     body: JSON.stringify({ user_id: window.__vault.userId }),
   });
   const data = await res.json();

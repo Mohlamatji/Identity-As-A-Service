@@ -2,109 +2,216 @@
 
 require __DIR__ . '/../vendor_autoload.php';
 
-// Local secrets, if you've set them up - see config/local.php.example.
-// Must load before database.php/providers.php/security.php, since those
-// all read secrets via getenv() at require-time.
+// Local secrets (config/local.php) must load before anything reads getenv().
 if (file_exists(__DIR__ . '/../config/local.php')) {
     require __DIR__ . '/../config/local.php';
 }
-
 require __DIR__ . '/../config/database.php';
 
-use App\Controllers\ApiController;
-use App\Controllers\WebhookController;
 use App\Controllers\AdminController;
+use App\Controllers\ApiController;
+use App\Controllers\PayPalController;
+use App\Controllers\WebhookController;
+use App\Services\ClientAuthService;
+use App\Services\IdempotencyService;
+use App\Services\RateLimitService;
+use App\Support\AdminAuth;
+use App\Support\AuthContext;
+use App\Support\Config;
+use App\Support\Http;
 
+date_default_timezone_set('UTC'); // storage is UTC; local-time logic uses Config timezone explicitly
+
+Http::securityHeaders();
+session_set_cookie_params([
+    'httponly' => true,
+    'samesite' => 'Strict',
+    'secure' => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
+]);
 session_start();
 
-$pdo = get_pdo();
-$security = require __DIR__ . '/../config/security.php';
+// Never leak stack traces / SQL to clients.
+set_exception_handler(function (Throwable $e) {
+    error_log('[identity-vault] ' . $e::class . ': ' . $e->getMessage() . ' @ ' . $e->getFile() . ':' . $e->getLine());
+    if (!headers_sent()) {
+        Http::json(500, ['status' => 'error', 'message' => 'Internal error.']);
+    }
+});
 
-// Strip whatever subfolder this app happens to be served from (e.g. when
-// dropped into an Apache/XAMPP htdocs folder as htdocs/identity-vault/public,
-// requests arrive as "/identity-vault/public/dashboard"), so routes below
-// can match on the clean path regardless of deployment depth. Confirmed
-// empirically: PHP's built-in server always reports SCRIPT_NAME as
-// "/index.php" here (basePath ""), and Apache with public/.htaccess
-// rewriting to index.php reports the full script path (e.g.
-// "/identity-vault/public/index.php", basePath "/identity-vault/public") -
-// both cases are handled correctly by this one computation.
+$pdo = get_pdo();
+
 $basePath = rtrim(dirname($_SERVER['SCRIPT_NAME']), '/');
 $requestPath = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH);
-$path = $basePath !== '' && str_starts_with($requestPath, $basePath)
-    ? substr($requestPath, strlen($basePath))
-    : $requestPath;
-if ($path === '') {
-    $path = '/';
-}
+$path = $basePath !== '' && str_starts_with($requestPath, $basePath) ? substr($requestPath, strlen($basePath)) : $requestPath;
+$path = $path === '' ? '/' : $path;
 $method = $_SERVER['REQUEST_METHOD'];
 
-// API key check, opt-in via config/security.php (API_KEY env var). Off by
-// default so local `php -S` testing and the README curl examples keep
-// working with zero setup - set API_KEY before deploying anywhere public.
-if (str_starts_with($path, '/api/') && $security['api_key'] !== null) {
-    $providedKey = $_SERVER['HTTP_X_API_KEY'] ?? '';
-    if (!hash_equals($security['api_key'], $providedKey)) {
-        http_response_code(401);
-        header('Content-Type: application/json');
-        echo json_encode(['error' => 'Unauthorized', 'message' => 'Missing or invalid X-Api-Key header.']);
+$api = new ApiController();
+$admin = new AdminController();
+$paypal = new PayPalController();
+$webhook = new WebhookController();
+$demo = Config::get('demo_mode');
+
+// ---- Page routes ---------------------------------------------------------
+$page = static function (string $view) {
+    return static function () use ($view) { require __DIR__ . '/../app/Views/' . $view . '.php'; };
+};
+$demoOnly = static function (callable $render) use ($demo) {
+    return static function () use ($render, $demo) {
+        if (!$demo) { header('Location: api-docs'); exit; }
+        $render();
+    };
+};
+
+$pages = [
+    ['GET', '#^/$#', $demoOnly($page('onboarding'))],
+    ['GET', '#^/checkout$#', $demoOnly($page('checkout'))],
+    ['GET', '#^/checkout/mock-paypal$#', $demoOnly($page('mock-paypal'))],
+    ['GET', '#^/api-docs$#', $page('api-docs')],
+    ['GET', '#^/dashboard$#', function () use ($admin) {
+        if (!AdminAuth::isAuthenticated()) { header('Location: login'); exit; }
+        $admin->dashboard();
+    }],
+    ['GET', '#^/login$#', fn () => $admin->loginForm()],
+    ['POST', '#^/login$#', fn () => $admin->login($pdo)],
+    ['GET', '#^/logout$#', fn () => $admin->logout()],
+];
+foreach ($pages as [$m, $re, $handler]) {
+    if ($m === $method && preg_match($re, $path)) {
+        $handler();
         exit;
     }
 }
 
-// Dashboard session check, opt-in via config/security.php (ADMIN_PASSWORD
-// env var). Off by default, same reasoning as the API key above.
-if ($path === '/dashboard' && $security['admin_password'] !== null && empty($_SESSION['admin_authenticated'])) {
-    header('Location: login');
+// ---- API routes ----------------------------------------------------------
+// [method, regex, scope|null|'admin', handler(match[]), options]
+$routes = [
+    ['POST', '#^/api/client-token$#', 'verify', fn () => $api->clientToken($pdo, $GLOBALS['auth'])],
+    ['POST', '#^/api/verify/challenge$#', 'verify', fn () => $api->challenge($pdo, $GLOBALS['auth']), ['limit' => ['challenge', 30]]],
+    ['POST', '#^/api/verify/session$#', 'verify', fn () => $api->authenticate($pdo, $GLOBALS['auth']), ['limit' => ['authenticate', 10]]],
+    ['POST', '#^/api/authenticate$#', 'verify', fn () => $api->authenticate($pdo, $GLOBALS['auth']), ['limit' => ['authenticate', 10]]],
+    ['POST', '#^/api/enroll$#', 'verify', fn () => $api->enroll($pdo, $GLOBALS['auth']), ['limit' => ['enroll', 10]]],
+    ['POST', '#^/api/transaction/approve$#', 'transactions', fn () => $api->transactionApprove($pdo, $GLOBALS['auth']), ['limit' => ['approve', 20], 'idempotent' => true]],
+    ['POST', '#^/api/behavior/update$#', 'transactions', fn () => $api->behaviorUpdate($pdo, $GLOBALS['auth'])],
+    ['GET', '#^/api/fraud/check$#', 'transactions', fn () => $api->fraudCheck($pdo, $GLOBALS['auth'])],
+    ['POST', '#^/api/consent/grant$#', 'consent', fn () => $api->consentGrant($pdo, $GLOBALS['auth'])],
+    ['GET', '#^/api/consent/status$#', 'consent', fn () => $api->consentStatus($pdo, $GLOBALS['auth'])],
+    ['POST', '#^/api/consent/revoke$#', 'consent', fn () => $api->consentRevoke($pdo, $GLOBALS['auth'])],
+    ['GET', '#^/api/data-subject/export$#', 'data_subject', fn () => $api->dataSubjectExport($pdo, $GLOBALS['auth'])],
+    ['POST', '#^/api/data-subject/delete-request$#', 'data_subject', fn () => $api->dataSubjectDeleteRequest($pdo, $GLOBALS['auth'])],
+    ['POST', '#^/api/webhook/notify/(\d+)$#', 'transactions', fn ($m) => $webhook->notify($pdo, $GLOBALS['auth'], (int) $m[1])],
+    ['GET', '#^/api/paypal/config$#', 'verify', fn () => $paypal->config()],
+    ['POST', '#^/api/paypal/orders$#', 'transactions', fn () => $paypal->createOrder($pdo, $GLOBALS['auth']), ['limit' => ['approve', 20], 'idempotent' => true]],
+    ['POST', '#^/api/paypal/orders/([A-Z0-9]{6,40})/capture$#', 'transactions', fn ($m) => $paypal->capture($pdo, $GLOBALS['auth'], $m[1]), ['idempotent' => true]],
+    ['POST', '#^/api/receipt/verify$#', 'transactions', fn () => $paypal->verifyReceipt()],
+    ['POST', '#^/api/paypal/webhook$#', null, fn () => $paypal->webhook($pdo)],
+    // Admin (session login OR a key with the admin scope)
+    ['GET', '#^/api/(?:admin/)?transactions$#', 'admin', fn () => $admin->transactions($pdo)],
+    ['GET', '#^/api/audit-log$#', 'admin', fn () => $admin->auditLog($pdo)],
+    ['GET', '#^/api/admin/audit/verify$#', 'admin', fn () => $admin->auditVerify($pdo)],
+    ['GET', '#^/api/admin/stats$#', 'admin', fn () => $admin->stats($pdo)],
+    ['GET', '#^/api/admin/transactions/(\d+)$#', 'admin', fn ($m) => $admin->transactionDetail($pdo, (int) $m[1])],
+    ['POST', '#^/api/admin/transactions/(\d+)/explain$#', 'admin', fn ($m) => $admin->explain($pdo, (int) $m[1])],
+    ['GET', '#^/api/dha-verifications$#', 'admin', fn () => $admin->dhaVerifications($pdo)],
+    ['POST', '#^/api/admin/retention/run$#', 'admin', fn () => $admin->runRetention($pdo)],
+];
+
+foreach ($routes as $route) {
+    [$m, $re, $scope, $handler] = $route;
+    $opts = $route[4] ?? [];
+    if ($m !== $method || !preg_match($re, $path, $match)) {
+        continue;
+    }
+
+    // --- authentication ---
+    $auth = null;
+    if ($scope === 'admin') {
+        if (AdminAuth::isAuthenticated() && AdminAuth::isConfigured() && !empty($_SESSION['admin_authenticated'])) {
+            if ($method === 'POST' && !AdminAuth::csrfValid()) {
+                Http::json(403, ['status' => 'error', 'message' => 'Missing or invalid CSRF token.']);
+                exit;
+            }
+            $auth = new AuthContext('admin_session', 'admin', 'Admin session', ['*']);
+        } else {
+            $keyAuth = (new ClientAuthService())->authenticate($pdo);
+            if ($keyAuth && $keyAuth->can('admin') && $keyAuth->type !== 'client_token') {
+                $auth = $keyAuth;
+            } elseif (!AdminAuth::isConfigured() && !Config::isProduction()) {
+                $auth = new AuthContext('open', 'open', 'Open development access', ['*']); // dev, no admin password set
+            }
+        }
+        if (!$auth) {
+            Http::json(401, ['status' => 'error', 'message' => 'Admin authentication required.']);
+            exit;
+        }
+    } elseif ($scope !== null) {
+        $auth = (new ClientAuthService())->authenticate($pdo);
+        if (!$auth) {
+            Http::json(401, ['status' => 'error', 'message' => 'Missing or invalid credentials. Send X-Api-Key (ivk_...) or Authorization: Bearer <ivt_ token>.']);
+            exit;
+        }
+        if (!$auth->can($scope)) {
+            Http::json(403, ['status' => 'error', 'message' => "Credential lacks the '{$scope}' scope."]);
+            exit;
+        }
+    }
+    $GLOBALS['auth'] = $auth;
+    $GLOBALS['pdo'] = $pdo;
+
+    // --- rate limiting: per client, plus a tighter per-IP bucket on sensitive routes ---
+    $limiter = new RateLimitService();
+    if ($auth && !$limiter->allow($pdo, 'client:' . $auth->clientId, $auth->rateLimitPerMin, 60)) {
+        Http::json(429, ['status' => 'error', 'message' => 'Rate limit exceeded for this client.'], ['Retry-After' => '30']);
+        exit;
+    }
+    if (isset($opts['limit']) && !$limiter->allow($pdo, RateLimitService::bucketKey(Http::ip(), $opts['limit'][0]), $opts['limit'][1], 60)) {
+        Http::json(429, ['status' => 'error', 'message' => 'Too many requests. Try again shortly.'], ['Retry-After' => '30']);
+        exit;
+    }
+
+    // --- idempotency for money-moving routes ---
+    $idemKey = null;
+    $idem = new IdempotencyService();
+    if (!empty($opts['idempotent']) && $auth) {
+        $idemKey = Http::header('Idempotency-Key');
+        if ($idemKey === null && Config::isProduction()) {
+            Http::json(422, ['status' => 'error', 'message' => 'Idempotency-Key header is required on this endpoint.']);
+            exit;
+        }
+        if ($idemKey !== null) {
+            if (!IdempotencyService::validKey($idemKey)) {
+                Http::json(422, ['status' => 'error', 'message' => 'Idempotency-Key must be 8-128 chars of [A-Za-z0-9_-:.].']);
+                exit;
+            }
+            $state = $idem->begin($pdo, $auth->clientId, $idemKey, hash('sha256', $method . $path . Http::rawBody()));
+            if ($state['state'] === 'replay') {
+                Http::json($state['status'], json_decode($state['body'], true) ?? [], ['Idempotent-Replay' => 'true']);
+                exit;
+            }
+            if ($state['state'] === 'conflict') {
+                Http::json(409, ['status' => 'error', 'message' => 'Idempotency-Key was already used with a different request.']);
+                exit;
+            }
+            if ($state['state'] === 'in_flight') {
+                Http::json(409, ['status' => 'error', 'message' => 'A request with this Idempotency-Key is still in progress.']);
+                exit;
+            }
+        }
+    }
+
+    try {
+        [$status, $body] = $handler($match);
+    } catch (Throwable $e) {
+        if ($idemKey !== null) {
+            $idem->abandon($pdo, $auth->clientId, $idemKey);
+        }
+        throw $e;
+    }
+    if ($idemKey !== null) {
+        $idem->finish($pdo, $auth->clientId, $idemKey, $status, json_encode($body));
+    }
+    Http::json($status, $body);
     exit;
 }
 
-// Very small router - fine for an MVP/pilot demo. Swap for a real router
-// (or a micro-framework) once route count grows.
-if ($path === '/' && $method === 'GET') {
-    require __DIR__ . '/../app/Views/onboarding.php';
-} elseif ($path === '/dashboard' && $method === 'GET') {
-    (new AdminController())->dashboard();
-} elseif ($path === '/login' && $method === 'GET') {
-    (new AdminController())->loginForm();
-} elseif ($path === '/login' && $method === 'POST') {
-    (new AdminController())->login();
-} elseif ($path === '/logout' && $method === 'GET') {
-    (new AdminController())->logout();
-} elseif ($path === '/api-docs' && $method === 'GET') {
-    require __DIR__ . '/../app/Views/api-docs.php';
-} elseif ($path === '/api/enroll' && $method === 'POST') {
-    (new ApiController())->enroll($pdo);
-} elseif ($path === '/api/authenticate' && $method === 'POST') {
-    (new ApiController())->authenticate($pdo);
-} elseif ($path === '/api/transaction/approve' && $method === 'POST') {
-    (new ApiController())->transactionApprove($pdo);
-} elseif ($path === '/api/behavior/update' && $method === 'POST') {
-    (new ApiController())->behaviorUpdate($pdo);
-} elseif ($path === '/api/fraud/check' && $method === 'GET') {
-    (new ApiController())->fraudCheck($pdo);
-} elseif ($path === '/api/consent/grant' && $method === 'POST') {
-    (new ApiController())->consentGrant($pdo);
-} elseif ($path === '/api/consent/status' && $method === 'GET') {
-    (new ApiController())->consentStatus($pdo);
-} elseif ($path === '/api/consent/revoke' && $method === 'POST') {
-    (new ApiController())->consentRevoke($pdo);
-} elseif ($path === '/api/data-subject/export' && $method === 'GET') {
-    (new ApiController())->dataSubjectExport($pdo);
-} elseif ($path === '/api/data-subject/delete-request' && $method === 'POST') {
-    (new ApiController())->dataSubjectDeleteRequest($pdo);
-} elseif ($path === '/api/admin/retention/run' && $method === 'POST') {
-    (new AdminController())->runRetention($pdo);
-} elseif ($path === '/api/dha-verifications' && $method === 'GET') {
-    (new AdminController())->dhaVerifications($pdo);
-} elseif ($path === '/api/transactions' && $method === 'GET') {
-    (new AdminController())->transactions($pdo);
-} elseif ($path === '/api/audit-log' && $method === 'GET') {
-    (new AdminController())->auditLog($pdo);
-} elseif (preg_match('#^/api/webhook/notify/(\d+)$#', $path, $m) && $method === 'POST') {
-    (new WebhookController())->notify($pdo, (int) $m[1]);
-} else {
-    http_response_code(404);
-    header('Content-Type: application/json');
-    echo json_encode(['error' => 'Not found', 'path' => $path]);
-}
+Http::json(404, ['error' => 'Not found', 'path' => $path]);

@@ -57,4 +57,24 @@ class BehaviorProfile
             'has_baseline' => true,
         ];
     }
+
+    /**
+     * Folds a session's keystroke-cadence features into the user's typing
+     * baseline (running average, then a slow EMA once enough samples exist).
+     * Only call after a TRUSTED (approved) transaction, same reasoning as
+     * upsert(): a fraudster's first attempt must not become "normal".
+     */
+    public static function updateTyping(PDO $pdo, int $userId, float $meanMs, float $stdMs): void
+    {
+        $p = self::find($pdo, $userId);
+        if (!$p) {
+            return;
+        }
+        $n = (int) ($p['typing_samples'] ?? 0);
+        $alpha = $n < 20 ? 1 / ($n + 1) : 0.05;
+        $newMean = $p['typing_mean_ms'] === null ? $meanMs : $p['typing_mean_ms'] + $alpha * ($meanMs - $p['typing_mean_ms']);
+        $newStd = $p['typing_std_ms'] === null ? $stdMs : $p['typing_std_ms'] + $alpha * ($stdMs - $p['typing_std_ms']);
+        $pdo->prepare('UPDATE behavior_profiles SET typing_mean_ms = ?, typing_std_ms = ?, typing_samples = ? WHERE user_id = ?')
+            ->execute([$newMean, $newStd, $n + 1, $userId]);
+    }
 }

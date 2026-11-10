@@ -2,37 +2,31 @@
 
 namespace App\Services;
 
-use App\Models\BiometricTemplate;
 use App\Models\AuditLog;
+use App\Models\BiometricTemplate;
+use App\Support\Config;
+use App\Support\Vec;
 use PDO;
 
 /**
- * Owns the "Identity Vault Match" step: encrypts and stores biometric
- * templates, and compares new captures against whatever is already
- * enrolled for a user. This runs BEFORE DHA verification - it proves "the
- * person transacting now is the same person who originally enrolled,"
- * which is a distinct claim from DHA proving "the enrolled person is who
- * their ID document says."
+ * Identity Vault Match: proves "the person transacting now is the same
+ * person who originally enrolled" (distinct from DHA proving "the enrolled
+ * person is who their ID says").
  *
- * Supports two template types, tracked via biometric_templates.algorithm_version:
- *  - 'face-descriptor-v1' - a real 128-float face-api.js embedding, compared
- *    by cosine similarity. Used when the client successfully extracts one.
- *  - 'mvp-sha256-stub-v1' - a SHA-256 hash of raw image bytes, compared by
- *    exact match. Fallback for clients without face-api.js/a camera.
- * A capture can only be compared against an enrollment made with the SAME
- * algorithm - see the mismatch branch below for why that fails closed
- * rather than silently comparing incompatible template formats.
+ * Template types (biometric_templates.algorithm_version):
+ *  - 'face-descriptor-v1': real 128-d face-api.js embedding, compared by
+ *    EUCLIDEAN DISTANCE - the metric face-api.js's recognition net is
+ *    actually trained/documented for (the previous cosine>=0.92 rule had no
+ *    basis for these embeddings). Confidence is derived from the distance so
+ *    borderline matches score lower in the Decision Engine.
+ *  - 'mvp-sha256-stub-v1': hash of image bytes, exact match only. Refused
+ *    entirely in production.
+ *
+ * Captures are only compared against enrollments of the same algorithm;
+ * mismatches fail closed with a re-enroll message.
  */
 class VaultService
 {
-    // Cosine similarity threshold for "same person" on face-api.js's 128-d
-    // descriptors. ILLUSTRATIVE: face-api.js's own examples use Euclidean
-    // distance (typically <0.6) rather than cosine similarity, so this
-    // number has no calibration data behind it yet - tune it against real
-    // enrolled-user capture pairs (same person, different sessions) before
-    // trusting it for anything beyond a demo.
-    private const FACE_DESCRIPTOR_MATCH_THRESHOLD = 0.92;
-
     public function enrollOrMatch(
         PDO $pdo,
         int $userId,
@@ -44,97 +38,64 @@ class VaultService
 
         if ($enrolled === null) {
             BiometricTemplate::create($pdo, $userId, $templateType, $templateVector, $algorithmVersion);
-            AuditLog::record($pdo, 'system', 'vault_enrolled', 'biometric_templates', $userId, $_SERVER['REMOTE_ADDR'] ?? null);
-
+            AuditLog::record($pdo, 'system', 'vault_enrolled', 'biometric_templates', $userId, $_SERVER['REMOTE_ADDR'] ?? null, ['algorithm' => $algorithmVersion]);
             return [
                 'is_first_enrollment' => true,
                 'matched' => true,
                 'confidence' => 1.0,
+                'distance' => null,
                 'algorithm' => $algorithmVersion,
                 'reason' => 'No prior enrollment found - treated as initial vault enrollment',
             ];
         }
 
-        // Can't meaningfully compare a real embedding against a hash stub
-        // (or vice versa) - fail closed rather than guess. This also
-        // surfaces as a normal, expected path the first time an existing
-        // hash-stub-enrolled user captures with a browser that now supports
-        // real descriptors: they need to re-enroll once to upgrade.
         if ($enrolled['algorithm_version'] !== $algorithmVersion) {
             AuditLog::record($pdo, 'system', 'vault_match_algorithm_mismatch', 'biometric_templates', $userId, $_SERVER['REMOTE_ADDR'] ?? null);
-
             return [
                 'is_first_enrollment' => false,
                 'matched' => false,
                 'confidence' => 0.0,
+                'distance' => null,
                 'algorithm' => $algorithmVersion,
-                'reason' => "Enrolled template uses '{$enrolled['algorithm_version']}' but this capture used "
-                    . "'{$algorithmVersion}' - can't compare reliably across algorithm versions. Re-enroll to upgrade.",
+                'reason' => "Enrolled template uses '{$enrolled['algorithm_version']}' but this capture used '{$algorithmVersion}' - re-enroll to upgrade.",
             ];
         }
 
+        $distance = null;
         if ($algorithmVersion === 'face-descriptor-v1') {
-            $newDescriptor = self::unpackDescriptor($templateVector);
-            $enrolledDescriptor = self::unpackDescriptor($enrolled['template_vector']);
-            $similarity = self::cosineSimilarity($newDescriptor, $enrolledDescriptor);
-            $confidence = round($similarity, 4);
-            $matched = $similarity >= self::FACE_DESCRIPTOR_MATCH_THRESHOLD;
+            $threshold = (float) Config::get('vault.match_distance_threshold', 0.5);
+            $distance = round(Vec::distance(self::unpackDescriptor($templateVector), self::unpackDescriptor($enrolled['template_vector'])), 4);
+            $matched = $distance <= $threshold;
+            // 0 distance -> 1.0, exactly at threshold -> 0.5, 2x threshold or worse -> 0.
+            $confidence = round(max(0.0, 1.0 - $distance / (2 * $threshold)), 4);
             $reason = $matched
-                ? "Face descriptor cosine similarity {$confidence} >= threshold " . self::FACE_DESCRIPTOR_MATCH_THRESHOLD
-                : "Face descriptor cosine similarity {$confidence} below threshold " . self::FACE_DESCRIPTOR_MATCH_THRESHOLD;
+                ? "Face embedding distance {$distance} <= threshold {$threshold}"
+                : "Face embedding distance {$distance} exceeds threshold {$threshold}";
         } else {
             $matched = hash_equals($enrolled['template_vector'], $templateVector);
             $confidence = $matched ? 1.0 : 0.0;
-            $reason = $matched
-                ? 'New capture matches enrolled vault template (exact-hash stub)'
-                : 'New capture does NOT match enrolled vault template (exact-hash stub) - possible impersonation';
+            $reason = $matched ? 'Exact-hash stub match (demo only)' : 'Exact-hash stub mismatch - possible impersonation';
         }
 
-        // Enrolled template stays as the source of truth; this capture is
-        // logged as a match attempt, not written over the vault.
-        AuditLog::record(
-            $pdo,
-            'system',
-            $matched ? 'vault_match_confirmed' : 'vault_match_failed',
-            'biometric_templates',
-            $userId,
-            $_SERVER['REMOTE_ADDR'] ?? null
-        );
+        AuditLog::record($pdo, 'system', $matched ? 'vault_match_confirmed' : 'vault_match_failed', 'biometric_templates', $userId, $_SERVER['REMOTE_ADDR'] ?? null, $distance !== null ? ['distance' => $distance] : null);
 
         return [
             'is_first_enrollment' => false,
             'matched' => $matched,
             'confidence' => $confidence,
+            'distance' => $distance,
             'algorithm' => $algorithmVersion,
             'reason' => $reason,
         ];
     }
 
-    /** Packs a float array (e.g. a 128-d face descriptor) into a binary string for storage. */
     public static function packDescriptor(array $descriptor): string
     {
-        return pack('g*', ...$descriptor);
+        return pack('g*', ...array_map('floatval', $descriptor));
     }
 
-    private static function unpackDescriptor(string $binary): array
+    public static function unpackDescriptor(string $binary): array
     {
         return array_values(unpack('g*', $binary));
-    }
-
-    private static function cosineSimilarity(array $a, array $b): float
-    {
-        $dot = 0.0;
-        $normA = 0.0;
-        $normB = 0.0;
-        $count = min(count($a), count($b));
-        for ($i = 0; $i < $count; $i++) {
-            $dot += $a[$i] * $b[$i];
-            $normA += $a[$i] * $a[$i];
-            $normB += $b[$i] * $b[$i];
-        }
-        if ($normA <= 0.0 || $normB <= 0.0) {
-            return 0.0;
-        }
-        return $dot / (sqrt($normA) * sqrt($normB));
     }
 }

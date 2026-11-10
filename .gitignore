@@ -9,3 +9,4 @@
 
 # .env files, if you use one instead of config/local.php
 .env
+storage/database.sqlite

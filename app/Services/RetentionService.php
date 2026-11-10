@@ -62,6 +62,17 @@ class RetentionService
         return [
             'biometric_templates_purged' => $this->purgeExpiredBiometricTemplates($pdo),
             'dha_responses_redacted' => $this->redactExpiredDhaResponses($pdo),
+            // Short-lived verification state (including the behavioural features
+            // and device fingerprint a session carries) needn't outlive a week.
+            'verification_sessions_purged' => $this->purgeShortLived($pdo, 'verification_sessions', 'expires_at', 7 * 86400),
+            'challenges_purged' => $this->purgeShortLived($pdo, 'challenges', 'expires_at', 86400),
         ];
+    }
+
+    private function purgeShortLived(PDO $pdo, string $table, string $column, int $graceSeconds): int
+    {
+        $stmt = $pdo->prepare("DELETE FROM {$table} WHERE {$column} < ?");
+        $stmt->execute([time() - $graceSeconds]);
+        return $stmt->rowCount();
     }
 }

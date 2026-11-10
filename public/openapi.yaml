@@ -1,17 +1,25 @@
 openapi: 3.0.3
 info:
   title: Identity Vault API
-  description: 'Biometric-first KYC / fraud-prevention pilot API. All monetary amounts are in ZAR (South
-    African Rand), represented as integer cents.
+  description: 'Identity-as-a-Service: server-verified liveness, Home Affairs identity checks, behavioural fraud
+    scoring, an explainable decision engine, a PayPal checkout gate and an advisory AI risk analyst. All amounts
+    are ZAR integer cents.
 
-    '
-  version: 0.2.0
+
+    **Trust model (v2):** the server issues a random liveness challenge, validates the evidence and returns a single-use
+    `verification_token`. `/api/transaction/approve` accepts only that token - never client-reported liveness or
+    match results.
+
+
+    **Auth:** secret keys (`ivk_...`, X-Api-Key) for servers; short-lived client tokens (`ivt_...`, Bearer) for
+    browsers, minted via `/api/client-token`.'
+  version: 2.0.0
 servers:
 - url: /
-  description: Relative to wherever this app is deployed (works under both `php -S` and Apache/XAMPP subfolder
-    deployments)
+  description: Relative to wherever this app is deployed (works under both `php -S` and Apache/XAMPP subfolder deployments)
 security:
 - ApiKeyAuth: []
+- ClientToken: []
 tags:
 - name: Identity
   description: Enrollment and biometric authentication
@@ -25,12 +33,16 @@ tags:
   description: Explicit consent records required before DHA verification (per VerifyNow terms)
 - name: Compliance
   description: POPIA data subject rights and retention policy
+- name: Verification
+  description: Server-issued liveness challenge -> verification token
+- name: PayPal
+  description: Identity-gated PayPal checkout
 paths:
   /api/enroll:
     post:
       tags:
       - Identity
-      summary: Create a user (if needed) and enroll their biometric template
+      summary: Enroll (or re-verify) a user. Requires a server-issued challenge; validates SA ID checksum and DOB.
       requestBody:
         required: true
         content:
@@ -43,37 +55,46 @@ paths:
               - dob
               - phone
               - image_base64
+              - challenge_id
               properties:
-                id_number:
+                id_number: &id001
                   type: string
-                  example: '8001015009087'
-                full_name:
-                  type: string
-                  example: Jane Test
+                full_name: *id001
                 dob:
                   type: string
                   format: date
-                  example: '1980-01-01'
-                phone:
-                  type: string
-                  example: 0821234567
-                image_base64:
-                  type: string
-                  description: Base64-encoded JPEG frame from the browser
-                mode:
+                phone: *id001
+                challenge_id: *id001
+                image_base64: *id001
+                mode: &id003
                   type: string
                   enum:
                   - real
                   - simulated
-                  default: simulated
-                blink_detected:
-                  type: boolean
-                head_turn_detected:
-                  type: boolean
-                frames_analyzed:
-                  type: integer
-                duration_ms:
-                  type: integer
+                  description: simulated is refused unless ALLOW_SIMULATED_LIVENESS (dev only)
+                actions: &id004
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      action: *id001
+                      completed:
+                        type: boolean
+                      t_ms: &id002
+                        type: integer
+                descriptors: &id005
+                  type: array
+                  description: 3-5 face-api.js 128-d descriptors sampled across the session
+                  items:
+                    type: array
+                    items:
+                      type: number
+                duration_ms: *id002
+                frames_analyzed: *id002
+                behavior: &id006
+                  type: object
+                  description: Timing-only behavioural biometrics (never key contents)
+                device_fingerprint: *id001
       responses:
         '200':
           description: Enrollment result
@@ -104,7 +125,7 @@ paths:
     post:
       tags:
       - Identity
-      summary: Verify a biometric sample against the vault (no transaction recorded)
+      summary: Alias of /api/verify/session
       requestBody:
         required: true
         content:
@@ -113,26 +134,19 @@ paths:
               type: object
               required:
               - user_id
+              - challenge_id
               - image_base64
               properties:
-                user_id:
-                  type: integer
-                image_base64:
-                  type: string
-                mode:
-                  type: string
-                  enum:
-                  - real
-                  - simulated
-                  default: simulated
-                blink_detected:
-                  type: boolean
-                head_turn_detected:
-                  type: boolean
-                frames_analyzed:
-                  type: integer
-                duration_ms:
-                  type: integer
+                user_id: *id002
+                challenge_id: *id001
+                image_base64: *id001
+                mode: *id003
+                actions: *id004
+                descriptors: *id005
+                duration_ms: *id002
+                frames_analyzed: *id002
+                behavior: *id006
+                device_fingerprint: *id001
       responses:
         '200':
           description: Authentication result
@@ -164,7 +178,7 @@ paths:
     post:
       tags:
       - Transactions
-      summary: Full pipeline - DHA verification, behavioral analytics, decision engine
+      summary: Run the full decision pipeline with a verification_token
       requestBody:
         required: true
         content:
@@ -174,96 +188,35 @@ paths:
               required:
               - user_id
               - id_number
+              - amount_cents
+              - verification_token
               properties:
-                user_id:
-                  type: integer
-                id_number:
-                  type: string
-                bank_partner_id:
-                  type: string
-                  default: demo-bank
-                amount_cents:
-                  type: integer
-                  description: Amount in ZAR cents, e.g. 500000 = R 5,000.00
-                  example: 500000
-                currency:
-                  type: string
-                  default: ZAR
+                user_id: *id002
+                id_number: *id001
+                amount_cents: *id002
+                currency: *id001
+                payee: *id001
+                bank_partner_id: *id001
+                verification_token: *id001
+                selfie_base64: *id001
                 realtime:
                   type: boolean
-                  default: true
-                liveness:
-                  $ref: '#/components/schemas/LivenessResult'
-                vault_match:
-                  $ref: '#/components/schemas/VaultMatchResult'
-                selfie_base64:
-                  type: string
-                device_fingerprint:
-                  type: string
-                ip_country:
-                  type: string
-                  example: ZA
-                new_device:
-                  type: boolean
-                  description: Explicit override for demos - forces the anomaly path
-                ip_country_mismatch:
-                  type: boolean
-                  description: Explicit override for demos
       responses:
         '200':
-          description: Decision result
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  status:
-                    type: string
-                    enum:
-                    - approved
-                    - flagged
-                    - rejected
-                  confidence:
-                    type: number
-                    format: float
-                  message:
-                    type: string
-                  transaction_id:
-                    type: integer
-                  amount:
-                    type: string
-                    example: R 5,000.00
-                  currency:
-                    type: string
-                    example: ZAR
-                  score:
-                    type: number
-                  dha:
-                    type: object
-                    properties:
-                      match_result:
-                        type: string
-                        enum:
-                        - match
-                        - no_match
-                        - error
-                      query_type:
-                        type: string
-                        enum:
-                        - realtime
-                        - batch
-                      cost_cents:
-                        type: integer
-                  behavioral:
-                    type: object
-        '404':
-          description: User not found - call /api/enroll first
-        '401':
-          description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
-        '429':
-          description: Too many transaction attempts (rate limited)
+          description: 'Decision: status approved|flagged|rejected, score, threshold, required_action (step_up|manual_review|retry_verification),
+            factors[], gates[], decision_id, signed receipt'
         '403':
-          description: No valid consent on file - call /api/consent/grant first
+          description: No consent, or token used/expired/for a different user/amount/payee
+        '409':
+          description: Idempotency-Key reuse conflict
+        '422':
+          description: verification_token missing, or id_number does not match the user
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        required: false
+        schema: *id001
+        description: 'Required in production. Retries return the original response (Idempotent-Replay: true).'
   /api/behavior/update:
     post:
       tags:
@@ -517,8 +470,7 @@ paths:
     post:
       tags:
       - Compliance
-      summary: Process an erasure request (POPIA s25) - deletes what's deletable, reports what's retained
-        and why
+      summary: Process an erasure request (POPIA s25) - deletes what's deletable, reports what's retained and why
       requestBody:
         required: true
         content:
@@ -547,16 +499,187 @@ paths:
           description: Retention run summary
         '401':
           description: Missing or invalid X-Api-Key header (only if API_KEY is configured on the server)
+  /api/client-token:
+    post:
+      tags:
+      - Verification
+      summary: Mint a short-lived browser token (secret keys only)
+      responses: &id007
+        '200':
+          description: OK
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id: *id002
+                scopes:
+                  type: array
+                  items: *id001
+  /api/verify/challenge:
+    post:
+      tags:
+      - Verification
+      summary: Issue a random single-use liveness challenge (optionally bound to an amount/payee)
+      responses: *id007
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                user_id: *id002
+                amount_cents: *id002
+                payee: *id001
+  /api/verify/session:
+    post:
+      tags:
+      - Verification
+      summary: Submit liveness evidence; server validates, matches the vault and returns a single-use verification_token
+      responses:
+        '200':
+          description: status approved|rejected; verification_token only when approved
+        '422':
+          description: Unknown/expired/used challenge
+        '429':
+          description: Too many failed attempts (lockout)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              - challenge_id
+              - image_base64
+              properties:
+                user_id: *id002
+                challenge_id: *id001
+                image_base64: *id001
+                mode: *id003
+                actions: *id004
+                descriptors: *id005
+                duration_ms: *id002
+                frames_analyzed: *id002
+                behavior: *id006
+                device_fingerprint: *id001
+  /api/paypal/config:
+    get:
+      tags:
+      - PayPal
+      summary: PayPal mode and currency (no secrets)
+      responses: *id007
+  /api/paypal/orders:
+    post:
+      tags:
+      - PayPal
+      summary: Verify + decide; create a PayPal order ONLY if approved
+      responses: *id007
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - user_id
+              - id_number
+              - amount_cents
+              - verification_token
+              properties:
+                user_id: *id002
+                id_number: *id001
+                amount_cents: *id002
+                verification_token: *id001
+                payee: *id001
+      parameters:
+      - name: Idempotency-Key
+        in: header
+        schema: *id001
+  /api/paypal/orders/{orderId}/capture:
+    post:
+      tags:
+      - PayPal
+      summary: Capture after buyer approval; refused without a valid signed approval receipt
+      responses: *id007
+      parameters:
+      - name: orderId
+        in: path
+        required: true
+        schema: *id001
+  /api/paypal/webhook:
+    post:
+      tags:
+      - PayPal
+      summary: PayPal webhook receiver (verified via PayPal verify-webhook-signature)
+      responses: *id007
+      security: []
+  /api/receipt/verify:
+    post:
+      tags:
+      - Transactions
+      summary: Verify a signed decision receipt
+      responses: *id007
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+              - receipt
+              properties:
+                receipt: *id001
+  /api/admin/stats:
+    get:
+      tags:
+      - Admin
+      summary: Dashboard aggregates
+      responses: *id007
+  /api/admin/transactions/{id}:
+    get:
+      tags:
+      - Admin
+      summary: Factor-level breakdown of one decision
+      responses: *id007
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: *id002
+  /api/admin/transactions/{id}/explain:
+    post:
+      tags:
+      - Admin
+      summary: AI risk analyst explanation (advisory; PII-free input)
+      responses: *id007
+      parameters:
+      - name: id
+        in: path
+        required: true
+        schema: *id002
+  /api/admin/audit/verify:
+    get:
+      tags:
+      - Admin
+      summary: Recompute the audit-log hash chain; reports the first broken entry
+      responses: *id007
 components:
   securitySchemes:
     ApiKeyAuth:
       type: apiKey
       in: header
       name: X-Api-Key
-      description: 'Only enforced if the API_KEY environment variable is set on the server. Unset by default
-        (dev-friendly) - all endpoints are open until you configure it.
-
-        '
+      description: 'Secret key (ivk_...) minted with bin/create-api-client.php. Scopes: verify, consent, transactions,
+        data_subject, admin.'
+    ClientToken:
+      type: http
+      scheme: bearer
+      description: Short-lived browser token (ivt_...) from POST /api/client-token. Verification flow scopes only.
   schemas:
     LivenessResult:
       type: object

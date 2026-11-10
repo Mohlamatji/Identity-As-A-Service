@@ -14,6 +14,32 @@ const ICONS = {
   bell: '<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M6 10.5a6 6 0 0112 0c0 3.6 1 5 2 6H4c1-1 2-2.4 2-6z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/><path d="M10 19a2 2 0 004 0" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>',
 };
 
+// Escape anything that originates from the server or a user before it goes
+// into innerHTML (the original rendered names/messages unescaped = stored XSS).
+function esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function authHeaders(extra = {}) {
+  return Object.assign({ Authorization: 'Bearer ' + (window.__TOKEN__ || '') }, extra);
+}
+
+/** Waterfall-style bars for the Decision Engine's structured factors. */
+function renderFactors(data) {
+  const rows = (data.gates || []).map((g) => `
+    <div class="flex items-start gap-2 text-xs"><span class="text-danger shrink-0 mono w-12">GATE</span><span class="text-slate-300"><b>${esc(g.label)}</b> - ${esc(g.detail)}</span></div>`).join('')
+    + (data.factors || []).map((f) => {
+      const pct = f.max ? Math.min(100, Math.round(Math.abs(f.points) / f.max * 100)) : 0;
+      const neg = f.points < 0;
+      return `<div class="text-xs">
+        <div class="flex justify-between"><span class="text-slate-300">${esc(f.label)}</span><span class="mono ${neg ? 'text-danger' : 'text-teal'}">${f.points >= 0 ? '+' : ''}${esc(f.points)}</span></div>
+        <div class="h-1 rounded bg-ink mt-1"><div class="h-1 rounded ${neg ? 'bg-danger' : 'bg-teal'}" style="width:${pct}%"></div></div>
+        <div class="text-mute mt-0.5">${esc(f.detail)}</div></div>`;
+    }).join('');
+  return `<div class="mt-4 space-y-2.5 border-t border-line pt-3">
+    <div class="text-[11px] text-mute">Why this decision (score ${esc(data.score)} vs threshold ${esc(data.threshold)})</div>${rows}</div>`;
+}
+
 function icon(name, cls = 'w-5 h-5') {
   return `<span class="${cls} inline-block">${ICONS[name] || ''}</span>`;
 }
@@ -37,8 +63,8 @@ function renderResultCard(containerId, opts) {
 
   const fieldsHtml = (opts.fields || []).map(([label, value]) => `
     <div>
-      <div class="text-[11px] text-mute">${label}</div>
-      <div class="text-sm text-slate-200 mono">${value}</div>
+      <div class="text-[11px] text-mute">${esc(label)}</div>
+      <div class="text-sm text-slate-200 mono">${esc(value)}</div>
     </div>
   `).join('');
 
@@ -48,14 +74,15 @@ function renderResultCard(containerId, opts) {
       <div class="flex items-start gap-3">
         <div class="${t.text} shrink-0 mt-0.5">${icon(t.icon, 'w-6 h-6')}</div>
         <div class="flex-1 min-w-0">
-          <div class="text-sm font-medium text-white">${opts.title}</div>
-          ${opts.detail ? `<div class="text-sm text-mute mt-0.5">${opts.detail}</div>` : ''}
+          <div class="text-sm font-medium text-white">${esc(opts.title)}</div>
+          ${opts.detail ? `<div class="text-sm text-mute mt-0.5 break-words">${esc(opts.detail)}</div>` : ''}
           ${fieldsHtml ? `<div class="grid grid-cols-2 sm:grid-cols-3 gap-3 mt-3">${fieldsHtml}</div>` : ''}
         </div>
       </div>
+      ${opts.extraHtml || ''}
       ${opts.raw ? `
         <button onclick="document.getElementById('${rawId}').classList.toggle('hidden')" class="text-xs text-mute hover:text-white mt-3 underline underline-offset-2">Show raw response</button>
-        <pre id="${rawId}" class="hidden mt-2 text-xs bg-ink border border-line rounded p-3 overflow-x-auto text-slate-400">${JSON.stringify(opts.raw, null, 2)}</pre>
+        <pre id="${rawId}" class="hidden mt-2 text-xs bg-ink border border-line rounded p-3 overflow-x-auto text-slate-400">${esc(JSON.stringify(opts.raw, null, 2))}</pre>
       ` : ''}
     </div>
   `;

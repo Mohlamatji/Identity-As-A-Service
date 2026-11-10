@@ -15,10 +15,14 @@
     <span class="font-semibold text-white tracking-tight">Identity Vault</span>
   </div>
   <p class="text-sm text-mute mb-6">Admin dashboard login</p>
+  <?php if (empty($configured)): ?>
+    <p class="text-sm text-gold mb-4">No admin password is configured. Set ADMIN_PASSWORD_HASH in config/local.php (see README).</p>
+  <?php endif; ?>
   <?php if (!empty($loginError)): ?>
     <p class="text-sm text-danger mb-4"><?= htmlspecialchars($loginError) ?></p>
   <?php endif; ?>
   <form method="POST" action="login">
+    <input type="hidden" name="csrf" value="<?= htmlspecialchars($loginCsrf ?? '') ?>">
     <label class="block mb-4">
       <span class="text-xs text-mute">Password</span>
       <input type="password" name="password" autofocus class="mt-1 w-full rounded border border-line bg-ink px-3 py-2 text-sm text-white focus:outline-none focus:border-gold">

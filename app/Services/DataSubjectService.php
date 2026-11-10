@@ -73,12 +73,15 @@ class DataSubjectService
 
         $consentRevoked = Consent::revoke($pdo, $userId);
 
-        // Anonymize direct identifiers - id_number_hash is left as-is since
-        // it's already a one-way hash, not reversible PII, and removing it
-        // would break the FK-adjacent audit trail's ability to confirm
-        // "this was the same person" without adding any real privacy benefit.
-        $stmt = $pdo->prepare("UPDATE users SET full_name = '[deleted]', phone_encrypted = ?, deleted_at = CURRENT_TIMESTAMP WHERE id = ?");
-        $stmt->execute([EncryptionService::encrypt(''), $userId]);
+        // Anonymize direct identifiers. The ID-number blind index is replaced
+        // with a random tombstone: even a keyed pseudonymous identifier is
+        // still linkable personal information, and this also lets the person
+        // legitimately re-register later without a UNIQUE collision.
+        $stmt = $pdo->prepare("UPDATE users SET full_name = '[deleted]', phone_encrypted = ?, id_number_hash = ?, deleted_at = CURRENT_TIMESTAMP WHERE id = ?");
+        $stmt->execute([EncryptionService::encrypt(''), 'erased:' . bin2hex(random_bytes(16)), $userId]);
+
+        // Kill pending verification state and the behavioural features it holds.
+        $pdo->prepare('UPDATE verification_sessions SET behavior_json = NULL, device_fingerprint = NULL, consumed_at = COALESCE(consumed_at, ?) WHERE user_id = ?')->execute([time(), $userId]);
 
         AuditLog::record($pdo, 'system', 'data_subject_erasure_processed', 'users', $userId, $_SERVER['REMOTE_ADDR'] ?? null);
 
@@ -88,7 +91,7 @@ class DataSubjectService
                 'behavior_profile' => true,
                 'consent_revoked' => $consentRevoked,
             ],
-            'anonymized' => ['full_name', 'phone'],
+            'anonymized' => ['full_name', 'phone', 'id_number_index'],
             'retained' => [
                 'transactions' => 'Retained - likely subject to an independent FICA/AML record-keeping duty (POPIA s14 permits retention where another law requires it). Confirm the exact retention period with counsel.',
                 'dha_verifications' => 'Row retained for the same reason; the raw bureau response payload is still subject to the normal retention-policy redaction schedule separately.',

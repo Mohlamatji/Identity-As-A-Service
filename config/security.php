@@ -1,17 +1,19 @@
 <?php
 /**
- * Security configuration. Both controls are OPT-IN via environment
- * variables, off by default so local `php -S` testing and the curl
- * examples in the README keep working with zero setup. Set these before
- * deploying anywhere reachable by the public.
+ * Security configuration.
+ *
+ * API keys now live in the database (api_clients table, hashed - mint them
+ * with bin/create-api-client.php). The legacy single API_KEY env var is
+ * still honoured as a full-scope "legacy" client so existing integrations
+ * keep working, but per-client keys are the supported path.
+ *
+ * Admin password: prefer ADMIN_PASSWORD_HASH (output of
+ * `php -r "echo password_hash('your-password', PASSWORD_DEFAULT);"`)
+ * over the plaintext ADMIN_PASSWORD.
  */
 
 return [
-    // If set, every /api/* request must send a matching X-Api-Key header.
-    // If unset/empty, /api/* is open (dev-friendly default).
-    'api_key' => getenv('API_KEY') ?: null,
-
-    // If set, /dashboard requires a session login using this password.
-    // If unset/empty, /dashboard is open (dev-friendly default).
+    'api_key' => getenv('API_KEY') ?: null, // legacy shared secret (full scope)
     'admin_password' => getenv('ADMIN_PASSWORD') ?: null,
+    'admin_password_hash' => getenv('ADMIN_PASSWORD_HASH') ?: null,
 ];
